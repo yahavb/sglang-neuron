@@ -51,6 +51,19 @@ class MuseGlimmerForConditionalGeneration(ModelHost):
             raise ValueError(f"{self.name}: tied word embeddings are not served")
         logger.info("%s decoder: %s", self.name, cfg)
 
+    def neuron_compiler_args(self, phase: str, default_args: list[str]) -> list[str]:
+        """The platform's arguments, and with MUSE_GLIMMER_NEURON_MODEL_TYPE set (e.g. "transformer", what the vLLM
+        Neuron port compiles the same graphs with) that model type in place of the platform's generic one: a list that
+        names a model type keeps it (backend/stack.py). Unset: the platform's arguments as they are."""
+        import os
+
+        args = super().neuron_compiler_args(phase, default_args)
+        model_type = os.environ.get("MUSE_GLIMMER_NEURON_MODEL_TYPE", "")
+        if model_type:
+            args = [a for a in args if not a.startswith("--model-type")] + [f"--model-type={model_type}"]
+            logger.info("%s %s compiler arguments: %s", self.name, phase, args)
+        return args
+
     def build_graph(self, phase: str, config) -> nn.Module:
         return MuseGlimmerGraph(text_config(config), phase)
 
