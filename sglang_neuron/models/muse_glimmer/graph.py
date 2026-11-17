@@ -34,6 +34,9 @@ DTYPE = torch.bfloat16
 # MUSE_GLIMMER_KV_ROW_WRITE=1: write K/V as rows of a [slots, d] view (exact, same values and slots) and declare the
 # caches in_place_targets, so the warm-up refuses a cache the NEFF copies back. Off: the original 3-D index write.
 KV_ROW_WRITE = os.environ.get("MUSE_GLIMMER_KV_ROW_WRITE", "0") == "1"
+# MUSE_GLIMMER_KV_ROW_GATHER=1: read the cached K/V as whole-page rows of a [pages, page * d] view (exact: same values,
+# same order). Off: the 5-D advanced-index gather and permute.
+KV_ROW_GATHER = os.environ.get("MUSE_GLIMMER_KV_ROW_GATHER", "0") == "1"
 # the decoder's prefix in the multimodal checkpoint (HF MuseGlimmerForConditionalGeneration)
 SRC = "model.language_model"
 
@@ -122,8 +125,14 @@ class Attention(nn.Module):
         # the cached K/V of each row: [B, nkh, nblk * bs, D]
         pages = self.k_cache.shape[0]
         table = torch.clamp(block_table, min=0).to(torch.long)
-        kc = self.k_cache[table].permute(0, 2, 1, 3, 4).reshape(B, nkh, nblk * bs, D)
-        vc = self.v_cache[table].permute(0, 2, 1, 3, 4).reshape(B, nkh, nblk * bs, D)
+        if KV_ROW_GATHER and nkh == 1:
+            # whole pages as rows of a [pages, page * d] view: one index_select of nblk rows of page * d each, the
+            # same values in the same order as the 5-D gather + permute below (one KV head: the permute moves nothing)
+            kc = self.k_cache.view(pages, bs * D).index_select(0, table.reshape(-1)).view(B, 1, nblk * bs, D)
+            vc = self.v_cache.view(pages, bs * D).index_select(0, table.reshape(-1)).view(B, 1, nblk * bs, D)
+        else:
+            kc = self.k_cache[table].permute(0, 2, 1, 3, 4).reshape(B, nkh, nblk * bs, D)
+            vc = self.v_cache[table].permute(0, 2, 1, 3, 4).reshape(B, nkh, nblk * bs, D)
 
         # the absolute position of each cached slot; a decode's sliding table is trimmed to the window and starts at
         # swa_kv_pos_offset
