@@ -13,6 +13,8 @@ Muse-Glimmer, as HF:
   - logits = cap * tanh(logits * output_multiplier / cap), on each rank's vocabulary shard
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from sglang.srt.distributed.parallel_state import get_attn_tp_group
@@ -29,6 +31,9 @@ from sglang_neuron.utils.checkpoints import SafetensorsCheckpoint
 from sglang_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 DTYPE = torch.bfloat16
+# MUSE_GLIMMER_KV_ROW_WRITE=1: write K/V as rows of a [slots, d] view (exact, same values and slots) and declare the
+# caches in_place_targets, so the warm-up refuses a cache the NEFF copies back. Off: the original 3-D index write.
+KV_ROW_WRITE = os.environ.get("MUSE_GLIMMER_KV_ROW_WRITE", "0") == "1"
 # the decoder's prefix in the multimodal checkpoint (HF MuseGlimmerForConditionalGeneration)
 SRC = "model.language_model"
 
@@ -155,8 +160,14 @@ class Attention(nn.Module):
         # write this step's K/V; slots outside the pool (padding) go to slot 0, on SGLang's reserved page
         slots = md["slot_mapping"].reshape(-1).to(torch.long)
         slots = torch.where((slots < 0) | (slots >= pages * bs), torch.zeros_like(slots), slots)
-        self.k_cache[slots // bs, :, slots % bs] = k.to(self.k_cache.dtype)
-        self.v_cache[slots // bs, :, slots % bs] = v.to(self.v_cache.dtype)
+        if KV_ROW_WRITE and nkh == 1:
+            # one row per slot of the [pages * page, d] view, as GLM-5.2's caches: a 1-D row index_put_ is written in
+            # place, where the 3-D advanced index below lowers to a copy of the whole cache (in_place_targets proves it)
+            self.k_cache.view(pages * bs, D).index_put_((slots,), k.reshape(T, D).to(self.k_cache.dtype))
+            self.v_cache.view(pages * bs, D).index_put_((slots,), v.reshape(T, D).to(self.v_cache.dtype))
+        else:
+            self.k_cache[slots // bs, :, slots % bs] = k.to(self.k_cache.dtype)
+            self.v_cache[slots // bs, :, slots % bs] = v.to(self.v_cache.dtype)
         return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
 
@@ -250,6 +261,17 @@ class MuseGlimmerGraph(nn.Module):
 
     def get_kv_spec(self) -> KVSpec:
         return KVSpec(layers=[LayerSpec(name=name) for name in self.layer_names])
+
+    def in_place_targets(self) -> dict:
+        """With MUSE_GLIMMER_KV_ROW_WRITE, the caches the graph writes in place, which the warm-up proves."""
+        if not KV_ROW_WRITE:
+            return {}
+        out = {}
+        for layer in self.layers:
+            a = layer.self_attn
+            if a.num_kv_heads == 1:
+                out[f"{a.name}.k_cache"], out[f"{a.name}.v_cache"] = a.k_cache, a.v_cache
+        return out
 
     def bind_kv_cache(self, kv_caches: dict) -> None:
         for layer in self.layers:
