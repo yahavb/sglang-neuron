@@ -37,6 +37,10 @@ KV_ROW_WRITE = os.environ.get("MUSE_GLIMMER_KV_ROW_WRITE", "0") == "1"
 # MUSE_GLIMMER_KV_ROW_GATHER=1: read the cached K/V as whole-page rows of a [pages, page * d] view (exact: same values,
 # same order). Off: the 5-D advanced-index gather and permute.
 KV_ROW_GATHER = os.environ.get("MUSE_GLIMMER_KV_ROW_GATHER", "0") == "1"
+# MUSE_GLIMMER_DENSE_DECODE=1: the decode attends over the whole KV pool read in place, the row's slots found by the
+# block table's inverse, instead of gathering its pages (profile: the gather is ~45 ms of a 91 ms step at a 16K pool).
+# Same keys and values; the softmax sums over the pool in another order. Off: the gather. Prefill keeps the gather.
+DENSE_DECODE = os.environ.get("MUSE_GLIMMER_DENSE_DECODE", "0") == "1"
 # the decoder's prefix in the multimodal checkpoint (HF MuseGlimmerForConditionalGeneration)
 SRC = "model.language_model"
 
@@ -101,6 +105,8 @@ class Attention(nn.Module):
         set_weight_loader(self.qkv_weight, weights.fused_qkv_weight_loader(tp, q, kvw, kv))
         set_weight_loader(self.gate_weight, column_rows_loader(q))
         set_weight_loader(self.o_weight, weights.row_parallel_loader(q))
+        # the decode graph's attention over the whole pool (MUSE_GLIMMER_DENSE_DECODE; set by the graph)
+        self.dense_decode = False
         # bound by bind_kv_cache: [pages, kv_heads, page, d] each
         self.k_cache = None
         self.v_cache = None
@@ -122,8 +128,10 @@ class Attention(nn.Module):
         if self.use_rope:
             q, k = _rope(q, cos, sin), _rope(k, cos, sin)
 
-        # the cached K/V of each row: [B, nkh, nblk * bs, D]
         pages = self.k_cache.shape[0]
+        if self.dense_decode and S == 1 and nkh == 1:
+            return self._dense_decode(x, q, k, v, positions, md, pages, bs, B, nblk, T)
+        # the cached K/V of each row: [B, nkh, nblk * bs, D]
         table = torch.clamp(block_table, min=0).to(torch.long)
         if KV_ROW_GATHER and nkh == 1:
             # whole pages as rows of a [pages, page * d] view: one index_select of nblk rows of page * d each, the
@@ -166,18 +174,57 @@ class Attention(nn.Module):
         attn = attn.permute(0, 2, 1, 3).reshape(T, nq * D)
         out = (attn * torch.sigmoid(x @ self.gate_weight)) @ self.o_weight
 
+        self._write_kv(k, v, md, pages, bs, T)
+        return neuron_collectives.all_reduce(self.attn_tp_group, out)
+
+    def _dense_decode(self, x, q, k, v, positions, md, pages, bs, B, nblk, T):
+        """MUSE_GLIMMER_DENSE_DECODE: a decode step (one token a row, one KV head a rank) over the whole pool, read in
+        place, with each slot's position from the inverse of the row's block table; slots outside the table are masked.
+        The same keys and values as the gather path, so the same attention up to the softmax's summation order."""
+        nq, D = self.num_heads, self.head_dim
+        C = pages * bs
+        dev = x.device
+        kc = self.k_cache.view(1, C, D)
+        vc = self.v_cache.view(1, C, D)
+        # each page's column in the row's table (-1: not in it); unused table entries go to a spare column
+        cols = torch.arange(nblk, device=dev).view(1, nblk).expand(B, nblk)
+        dst = torch.where(md["block_table_tensor"] >= 0, md["block_table_tensor"].to(torch.long),
+                          torch.full_like(cols, pages))
+        inv = torch.full((B, pages + 1), -1, dtype=torch.long, device=dev).scatter(1, dst, cols)[:, :pages]
+        slot_pos = (inv.unsqueeze(-1) * bs + torch.arange(bs, device=dev).view(1, 1, bs)).view(B, C)
+        valid = (inv >= 0).unsqueeze(-1).expand(B, pages, bs).reshape(B, C)
+        offset = md.get("swa_kv_pos_offset")
+        if self.sliding_window is not None and offset is not None:
+            slot_pos = slot_pos + offset.view(B, 1).to(slot_pos.dtype)
+        pos = positions.view(B, 1).to(slot_pos.dtype)
+        prior_ok = valid & (slot_pos < pos)
+        if self.sliding_window is not None:
+            prior_ok = prior_ok & (slot_pos > pos - self.sliding_window)
+        qf = q.view(B, nq, D).float()
+        s_prior = torch.matmul(qf, kc.float().transpose(-1, -2))  # [B, nq, C]
+        s_new = (qf * k.view(B, 1, D).float()).sum(-1, keepdim=True)  # [B, nq, 1]
+        s_prior = s_prior.masked_fill(~prior_ok.view(B, 1, C), float("-inf"))
+        p = torch.softmax(torch.cat([s_prior, s_new], dim=-1), dim=-1)
+        attn = torch.matmul(p[..., :C], vc.float()) + p[..., C:] * v.view(B, 1, D).float()  # [B, nq, D]
+        attn = attn.to(DTYPE).reshape(T, nq * D)
+        out = (attn * torch.sigmoid(x @ self.gate_weight)) @ self.o_weight
+        self._write_kv(k, v, md, pages, bs, T)
+        return neuron_collectives.all_reduce(self.attn_tp_group, out)
+
+    def _write_kv(self, k, v, md, pages, bs, T):
+        D = self.head_dim
+        nkh = self.num_kv_heads
         # write this step's K/V; slots outside the pool (padding) go to slot 0, on SGLang's reserved page
         slots = md["slot_mapping"].reshape(-1).to(torch.long)
         slots = torch.where((slots < 0) | (slots >= pages * bs), torch.zeros_like(slots), slots)
         if KV_ROW_WRITE and nkh == 1:
-            # one row per slot of the [pages * page, d] view, as GLM-5.2's caches: a 1-D row index_put_ is written in
-            # place, where the 3-D advanced index below lowers to a copy of the whole cache (in_place_targets proves it)
+            # one row per slot of the [pages * page, d] view, as GLM-5.2's caches. Measured on trn2: no faster than the
+            # 3-D index write below (both written in place; in_place_targets checks it at warm-up)
             self.k_cache.view(pages * bs, D).index_put_((slots,), k.reshape(T, D).to(self.k_cache.dtype))
             self.v_cache.view(pages * bs, D).index_put_((slots,), v.reshape(T, D).to(self.v_cache.dtype))
         else:
             self.k_cache[slots // bs, :, slots % bs] = k.to(self.k_cache.dtype)
             self.v_cache[slots // bs, :, slots % bs] = v.to(self.v_cache.dtype)
-        return neuron_collectives.all_reduce(self.attn_tp_group, out)
 
 
 def _rope(x, cos, sin):
@@ -237,6 +284,8 @@ class MuseGlimmerGraph(nn.Module):
         self.embed_tokens = VocabDimShardedEmbedding(config.vocab_size, config.hidden_size, dtype=DTYPE,
                                                      tp_group=group.device_group)
         self.layers = nn.ModuleList([DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
+        for layer in self.layers:
+            layer.self_attn.dense_decode = DENSE_DECODE and phase == "decode"
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(config.hidden_size, config.vocab_size, dtype=DTYPE, gather_output=True,
                                             tp_group=group.device_group)
