@@ -37,6 +37,9 @@ KV_ROW_WRITE = os.environ.get("MUSE_GLIMMER_KV_ROW_WRITE", "0") == "1"
 # MUSE_GLIMMER_KV_ROW_GATHER=1: read the cached K/V as whole-page rows of a [pages, page * d] view (exact: same values,
 # same order). Off: the 5-D advanced-index gather and permute.
 KV_ROW_GATHER = os.environ.get("MUSE_GLIMMER_KV_ROW_GATHER", "0") == "1"
+# MUSE_GLIMMER_KV_ONEHOT_GATHER=1: gather the row's pages by a one-hot matmul over the pool (exact: one 1 * x term per
+# element), prefill and decode. Off: the 5-D advanced-index gather.
+KV_ONEHOT_GATHER = os.environ.get("MUSE_GLIMMER_KV_ONEHOT_GATHER", "0") == "1"
 # MUSE_GLIMMER_DENSE_DECODE=1: the decode attends over the whole KV pool read in place, the row's slots found by the
 # block table's inverse, instead of gathering its pages (profile: the gather is ~45 ms of a 91 ms step at a 16K pool).
 # Same keys and values; the softmax sums over the pool in another order. Off: the gather. Prefill keeps the gather.
@@ -133,7 +136,14 @@ class Attention(nn.Module):
             return self._dense_decode(x, q, k, v, positions, md, pages, bs, B, nblk, T)
         # the cached K/V of each row: [B, nkh, nblk * bs, D]
         table = torch.clamp(block_table, min=0).to(torch.long)
-        if KV_ROW_GATHER and nkh == 1:
+        if KV_ONEHOT_GATHER and nkh == 1:
+            # the row's pages in table order by a one-hot matmul over the whole pool, read in place: each output element
+            # is one 1 * x term (the rest exact zeros of a zero-initialised, finite pool), so the same bf16 values as
+            # the gather below, without its dynamic DMA
+            onehot = (table.unsqueeze(-1) == torch.arange(pages, device=x.device).view(1, 1, pages)).to(DTYPE)
+            kc = torch.matmul(onehot, self.k_cache.view(pages, bs * D)).view(B, 1, nblk * bs, D)
+            vc = torch.matmul(onehot, self.v_cache.view(pages, bs * D)).view(B, 1, nblk * bs, D)
+        elif KV_ROW_GATHER and nkh == 1:
             # whole pages as rows of a [pages, page * d] view: one index_select of nblk rows of page * d each, the
             # same values in the same order as the 5-D gather + permute below (one KV head: the permute moves nothing)
             kc = self.k_cache.view(pages, bs * D).index_select(0, table.reshape(-1)).view(B, 1, nblk * bs, D)
